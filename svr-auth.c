@@ -33,10 +33,10 @@
 #include "packet.h"
 #include "auth.h"
 #include "runopts.h"
+#include "dbrandom.h"
 
 static void authclear();
 static int checkusername(unsigned char *username, unsigned int userlen);
-static void send_msg_userauth_banner();
 
 /* initialise the first time for a session, resetting all parameters */
 void svr_authinitialise() {
@@ -83,24 +83,17 @@ static void authclear() {
 
 /* Send a banner message if specified to the client. The client might
  * ignore this, but possibly serves as a legal "no trespassing" sign */
-static void send_msg_userauth_banner() {
+void send_msg_userauth_banner(buffer *banner) {
 
 	TRACE(("enter send_msg_userauth_banner"))
-	if (svr_opts.banner == NULL) {
-		TRACE(("leave send_msg_userauth_banner: banner is NULL"))
-		return;
-	}
 
 	CHECKCLEARTOWRITE();
 
 	buf_putbyte(ses.writepayload, SSH_MSG_USERAUTH_BANNER);
-	buf_putstring(ses.writepayload, buf_getptr(svr_opts.banner,
-				svr_opts.banner->len), svr_opts.banner->len);
+	buf_putbufstring(ses.writepayload, banner);
 	buf_putstring(ses.writepayload, "en", 2);
 
 	encrypt_packet();
-	buf_free(svr_opts.banner);
-	svr_opts.banner = NULL;
 
 	TRACE(("leave send_msg_userauth_banner"))
 }
@@ -111,6 +104,7 @@ void recv_msg_userauth_request() {
 
 	unsigned char *username = NULL, *servicename = NULL, *methodname = NULL;
 	unsigned int userlen, servicelen, methodlen;
+	int valid_user = 0;
 
 	TRACE(("enter recv_msg_userauth_request"))
 
@@ -122,7 +116,9 @@ void recv_msg_userauth_request() {
 
 	/* send the banner if it exists, it will only exist once */
 	if (svr_opts.banner) {
-		send_msg_userauth_banner();
+		send_msg_userauth_banner(svr_opts.banner);
+		buf_free(svr_opts.banner);
+		svr_opts.banner = NULL;
 	}
 
 	username = buf_getstring(ses.payload, &userlen);
@@ -141,23 +137,40 @@ void recv_msg_userauth_request() {
 		dropbear_exit("unknown service in auth");
 	}
 
+	/* check username is good before continuing. 
+	 * the 'incrfail' varies depending on the auth method to
+	 * avoid giving away which users exist on the system through
+	 * the time delay. */
+	if (checkusername(username, userlen) == DROPBEAR_SUCCESS) {
+		valid_user = 1;
+	}
+
 	/* user wants to know what methods are supported */
 	if (methodlen == AUTH_METHOD_NONE_LEN &&
 			strncmp(methodname, AUTH_METHOD_NONE,
 				AUTH_METHOD_NONE_LEN) == 0) {
 		TRACE(("recv_msg_userauth_request: 'none' request"))
-		send_msg_userauth_failure(0, 0);
-		goto out;
+		if (valid_user
+				&& svr_opts.allowblankpass
+				&& !svr_opts.noauthpass
+				&& !(svr_opts.norootpass && ses.authstate.pw_uid == 0) 
+				&& ses.authstate.pw_passwd[0] == '\0') 
+		{
+			dropbear_log(LOG_NOTICE, 
+					"Auth succeeded with blank password for '%s' from %s",
+					ses.authstate.pw_name,
+					svr_ses.addrstring);
+			send_msg_userauth_success();
+			goto out;
+		}
+		else
+		{
+			/* 'none' has no failure delay */
+			send_msg_userauth_failure(0, 0);
+			goto out;
+		}
 	}
 	
-	/* check username is good before continuing */
-	if (checkusername(username, userlen) == DROPBEAR_FAILURE) {
-		/* username is invalid/no shell/etc - send failure */
-		TRACE(("sending checkusername failure"))
-		send_msg_userauth_failure(0, 1);
-		goto out;
-	}
-
 #ifdef ENABLE_SVR_PASSWORD_AUTH
 	if (!svr_opts.noauthpass &&
 			!(svr_opts.norootpass && ses.authstate.pw_uid == 0) ) {
@@ -165,8 +178,10 @@ void recv_msg_userauth_request() {
 		if (methodlen == AUTH_METHOD_PASSWORD_LEN &&
 				strncmp(methodname, AUTH_METHOD_PASSWORD,
 					AUTH_METHOD_PASSWORD_LEN) == 0) {
-			svr_auth_password();
-			goto out;
+			if (valid_user) {
+				svr_auth_password();
+				goto out;
+			}
 		}
 	}
 #endif
@@ -178,25 +193,32 @@ void recv_msg_userauth_request() {
 		if (methodlen == AUTH_METHOD_PASSWORD_LEN &&
 				strncmp(methodname, AUTH_METHOD_PASSWORD,
 					AUTH_METHOD_PASSWORD_LEN) == 0) {
-			svr_auth_pam();
-			goto out;
+			if (valid_user) {
+				svr_auth_pam();
+				goto out;
+			}
 		}
 	}
 #endif
 
 #ifdef ENABLE_SVR_PUBKEY_AUTH
 	/* user wants to try pubkey auth */
-    if (!svr_opts.noauthpubkey) {
-        if (methodlen == AUTH_METHOD_PUBKEY_LEN &&
-                strncmp(methodname, AUTH_METHOD_PUBKEY,
-                    AUTH_METHOD_PUBKEY_LEN) == 0) {
-            svr_auth_pubkey();
-            goto out;
-        }
-    }
+	if (!svr_opts.noauthpubkey) {
+		if (methodlen == AUTH_METHOD_PUBKEY_LEN &&
+				strncmp(methodname, AUTH_METHOD_PUBKEY,
+					AUTH_METHOD_PUBKEY_LEN) == 0) {
+			if (valid_user) {
+				svr_auth_pubkey();
+			} else {
+				/* pubkey has no failure delay */
+				send_msg_userauth_failure(0, 0);
+			}
+			goto out;
+		}
+	}
 #endif
 
-	/* nothing matched, we just fail */
+	/* nothing matched, we just fail with a delay */
 	send_msg_userauth_failure(0, 1);
 
 out:
@@ -207,13 +229,13 @@ out:
 }
 
 
-/* Check that the username exists, has a non-empty password, and has a valid
- * shell.
+/* Check that the username exists and isn't disallowed (root), and has a valid shell.
  * returns DROPBEAR_SUCCESS on valid username, DROPBEAR_FAILURE on failure */
 static int checkusername(unsigned char *username, unsigned int userlen) {
 
 	char* listshell = NULL;
 	char* usershell = NULL;
+	uid_t uid;
 	TRACE(("enter checkusername"))
 
 	if (userlen > MAX_USERNAME_LEN) {
@@ -224,7 +246,7 @@ static int checkusername(unsigned char *username, unsigned int userlen) {
 		strcmp(username, ses.authstate.username) != 0) {
 			/* the username needs resetting */
 			if (ses.authstate.username != NULL) {
-				dropbear_log(LOG_WARNING, "client trying multiple usernames from %s",
+				dropbear_log(LOG_WARNING, "Client trying multiple usernames from %s",
 							svr_ses.addrstring);
 				m_free(ses.authstate.username);
 			}
@@ -250,9 +272,19 @@ static int checkusername(unsigned char *username, unsigned int userlen) {
 	if (!ses.authstate.pw_name) {
 		TRACE(("leave checkusername: user '%s' doesn't exist", username))
 		dropbear_log(LOG_WARNING,
-				"login attempt for nonexistent user from %s",
+				"Login attempt for nonexistent user from %s",
 				svr_ses.addrstring);
-		send_msg_userauth_failure(0, 1);
+		return DROPBEAR_FAILURE;
+	}
+
+	/* check if we are running as non-root, and login user is different from the server */
+	uid = geteuid();
+	if (uid != 0 && uid != ses.authstate.pw_uid) {
+		TRACE(("running as nonroot, only server uid is allowed"))
+		dropbear_log(LOG_WARNING,
+				"Login attempt with wrong user %s from %s",
+				ses.authstate.pw_name,
+				svr_ses.addrstring);
 		return DROPBEAR_FAILURE;
 	}
 
@@ -299,9 +331,8 @@ static int checkusername(unsigned char *username, unsigned int userlen) {
 	/* no matching shell */
 	endusershell();
 	TRACE(("no matching shell"))
-	dropbear_log(LOG_WARNING, "user '%s' has invalid shell, rejected",
+	dropbear_log(LOG_WARNING, "User '%s' has invalid shell, rejected",
 				ses.authstate.pw_name);
-	send_msg_userauth_failure(0, 1);
 	return DROPBEAR_FAILURE;
 goodshell:
 	endusershell();
@@ -311,7 +342,6 @@ goodshell:
 	TRACE(("uid = %d", ses.authstate.pw_uid))
 	TRACE(("leave checkusername"))
 	return DROPBEAR_SUCCESS;
-
 }
 
 /* Send a failure message to the client, in responds to a userauth_request.
@@ -343,12 +373,10 @@ void send_msg_userauth_failure(int partial, int incrfail) {
 		buf_putbytes(typebuf, AUTH_METHOD_PASSWORD, AUTH_METHOD_PASSWORD_LEN);
 	}
 
-	buf_setpos(typebuf, 0);
-	buf_putstring(ses.writepayload, buf_getptr(typebuf, typebuf->len),
-			typebuf->len);
+	buf_putbufstring(ses.writepayload, typebuf);
 
-	TRACE(("auth fail: methods %d, '%s'", ses.authstate.authtypes,
-				buf_getptr(typebuf, typebuf->len)));
+	TRACE(("auth fail: methods %d, '%.*s'", ses.authstate.authtypes,
+				typebuf->len, typebuf->data))
 
 	buf_free(typebuf);
 
@@ -356,7 +384,11 @@ void send_msg_userauth_failure(int partial, int incrfail) {
 	encrypt_packet();
 
 	if (incrfail) {
-		usleep(300000); /* XXX improve this */
+		unsigned int delay;
+		genrandom((unsigned char*)&delay, sizeof(delay));
+		/* We delay for 300ms +- 50ms */
+		delay = 250000 + (delay % 100000);
+		usleep(delay);
 		ses.authstate.failcount++;
 	}
 

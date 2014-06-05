@@ -129,22 +129,22 @@ do_local_cmd(arglist *a)
 			fprintf(stderr, " %s", a->list[i]);
 		fprintf(stderr, "\n");
 	}
-#ifdef __uClinux__
+#ifdef USE_VFORK
 	pid = vfork();
 #else
 	pid = fork();
-#endif /* __uClinux__ */
+#endif
 	if (pid == -1)
 		fatal("do_local_cmd: fork: %s", strerror(errno));
 
 	if (pid == 0) {
 		execvp(a->list[0], a->list);
 		perror(a->list[0]);
-#ifdef __uClinux__
+#ifdef USE_VFORK
 		_exit(1);
 #else
 		exit(1);
-#endif /* __uClinux__ */
+#endif
 	}
 
 	do_cmd_pid = pid;
@@ -169,6 +169,16 @@ do_local_cmd(arglist *a)
  * given host.  This returns < 0 if execution fails, and >= 0 otherwise. This
  * assigns the input and output file descriptors on success.
  */
+
+static void
+arg_setup(char *host, char *remuser, char *cmd)
+{
+	replacearg(&args, 0, "%s", ssh_program);
+	if (remuser != NULL)
+		addargs(&args, "-l%s", remuser);
+	addargs(&args, "%s", host);
+	addargs(&args, "%s", cmd);
+}
 
 int
 do_cmd(char *host, char *remuser, char *cmd, int *fdin, int *fdout, int argc)
@@ -197,22 +207,18 @@ do_cmd(char *host, char *remuser, char *cmd, int *fdin, int *fdout, int argc)
 	close(reserved[0]);
 	close(reserved[1]);
 
-    /* uClinux needs to build the args here before vforking,
-       otherwise we do it later on. */
-#ifdef __uClinux__
-		replacearg(&args, 0, "%s", ssh_program);
-		if (remuser != NULL)
-			addargs(&args, "-l%s", remuser);
-		addargs(&args, "%s", host);
-		addargs(&args, "%s", cmd);
-#endif /* __uClinux__ */
+	/* uClinux needs to build the args here before vforking,
+	   otherwise we do it later on. */
+#ifdef USE_VFORK
+	arg_setup(host, remuser, cmd);
+#endif
 
 	/* Fork a child to execute the command on the remote host using ssh. */
-#ifdef __uClinux__
+#ifdef USE_VFORK
 	do_cmd_pid = vfork();
 #else
 	do_cmd_pid = fork();
-#endif /* __uClinux__ */
+#endif
 
 	if (do_cmd_pid == 0) {
 		/* Child. */
@@ -223,27 +229,22 @@ do_cmd(char *host, char *remuser, char *cmd, int *fdin, int *fdout, int argc)
 		close(pin[0]);
 		close(pout[1]);
 
-#ifndef __uClinux__
-		replacearg(&args, 0, "%s", ssh_program);
-		if (remuser != NULL)
-			addargs(&args, "-l%s", remuser);
-		addargs(&args, "%s", host);
-		addargs(&args, "%s", cmd);
-#endif /* __uClinux__ */
+#ifndef USE_VFORK
+		arg_setup(host, remuser, cmd);
+#endif
 
 		execvp(ssh_program, args.list);
 		perror(ssh_program);
-#ifndef __uClinux__
-		exit(1);
-#else
+#ifdef USE_VFORK
 		_exit(1);
-#endif /* __uClinux__ */
+#else
+		exit(1);
+#endif
 	} else if (do_cmd_pid == -1) {
 		fatal("fork: %s", strerror(errno));
 	}
 
-
-#ifdef __uClinux__
+#ifdef USE_VFORK
 	/* clean up command */
 	/* pop cmd */
 	xfree(args.list[args.num-1]);
@@ -259,7 +260,7 @@ do_cmd(char *host, char *remuser, char *cmd, int *fdin, int *fdout, int argc)
 		args.list[args.num-1]=NULL;
 		args.num--;
 	}
-#endif /* __uClinux__ */
+#endif
 
 	/* Parent.  Close the other side, and return the local side. */
 	close(pin[0]);
@@ -342,7 +343,7 @@ main(int argc, char **argv)
 			addargs(&args, "-p%s", optarg);
 			break;
 		case 'B':
-			addargs(&args, "-oBatchmode yes");
+			fprintf(stderr, "Note: -B option is disabled in this version of scp");
 			break;
 		case 'l':
 			speed = strtod(optarg, &endp);
@@ -363,12 +364,12 @@ main(int argc, char **argv)
 			addargs(&args, "-v");
 			verbose_mode = 1;
 			break;
-#ifdef PROGRESS_METER
 		case 'q':
+#ifdef PROGRESS_METER
 			addargs(&args, "-q");
 			showprogress = 0;
-			break;
 #endif
+			break;
 
 		/* Server options. */
 		case 'd':
@@ -491,9 +492,13 @@ toremote(char *targ, int argc, char **argv)
 			addargs(&alist, "%s", ssh_program);
 			if (verbose_mode)
 				addargs(&alist, "-v");
+#if 0
+			/* Disabled since dbclient won't understand them
+			   and scp works fine without them. */
 			addargs(&alist, "-x");
 			addargs(&alist, "-oClearAllForwardings yes");
 			addargs(&alist, "-n");
+#endif
 
 			*src++ = 0;
 			if (*src == 0)
@@ -762,6 +767,60 @@ rsource(char *name, struct stat *statp)
 }
 
 void
+bwlimit(int amount)
+{
+	static struct timeval bwstart, bwend;
+	static int lamt, thresh = 16384;
+	uint64_t waitlen;
+	struct timespec ts, rm;
+
+	if (!timerisset(&bwstart)) {
+		gettimeofday(&bwstart, NULL);
+		return;
+	}
+
+	lamt += amount;
+	if (lamt < thresh)
+		return;
+
+	gettimeofday(&bwend, NULL);
+	timersub(&bwend, &bwstart, &bwend);
+	if (!timerisset(&bwend))
+		return;
+
+	lamt *= 8;
+	waitlen = (double)1000000L * lamt / limit_rate;
+
+	bwstart.tv_sec = waitlen / 1000000L;
+	bwstart.tv_usec = waitlen % 1000000L;
+
+	if (timercmp(&bwstart, &bwend, >)) {
+		timersub(&bwstart, &bwend, &bwend);
+
+		/* Adjust the wait time */
+		if (bwend.tv_sec) {
+			thresh /= 2;
+			if (thresh < 2048)
+				thresh = 2048;
+		} else if (bwend.tv_usec < 100) {
+			thresh *= 2;
+			if (thresh > 32768)
+				thresh = 32768;
+		}
+
+		TIMEVAL_TO_TIMESPEC(&bwend, &ts);
+		while (nanosleep(&ts, &rm) == -1) {
+			if (errno != EINTR)
+				break;
+			ts = rm;
+		}
+	}
+
+	lamt = 0;
+	gettimeofday(&bwstart, NULL);
+}
+
+void
 sink(int argc, char **argv)
 {
 	static BUF buffer;
@@ -964,6 +1023,9 @@ bad:			run_err("%s: %s", np, strerror(errno));
 				cp += j;
 				statbytes += j;
 			} while (amt > 0);
+
+			if (limit_rate)
+				bwlimit(4096);
 
 			if (count == bp->cnt) {
 				/* Keep reading so we stay sync'd up. */
